@@ -1,16 +1,5 @@
-#Author-Brian Ekins
-#Description-Creates sketch geometry that is the intersection of selected mesh bodies and the x-y plane of the active sketch.
-# (C) Copyright 2016 by Autodesk, Inc.
-# Permission to use, copy, modify, and distribute this software in object code form 
-# for any purpose and without fee is hereby granted, provided that the above copyright 
-# notice appears in all copies and that both that copyright notice and the limited  
-# warrantyand restricted rights notice below appear in all supporting documentation.
-
-# AUTODESK PROVIDES THIS PROGRAM "AS IS" AND WITH ALL FAULTS. AUTODESK SPECIFICALLY 
-# DISCLAIMS ANY IMPLIED WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR USE. 
-# AUTODESK, INC. DOES NOT WARRANT THAT THE OPERATION OF THE PROGRAM WILL BE 
-# UNINTERRUPTED OR ERROR FREE.
-
+#Author - Nick Otradovec
+#Description - Creates a 3D Sketch Line or Lines Projected along Z onto a Mesh from a 2D Sketch
 
 import adsk.core, adsk.fusion, traceback
 import math
@@ -19,14 +8,15 @@ import time
 from . import commands
 from .lib import fusion360utils as futil
 
-# Globals variables.
 _des = adsk.fusion.Design.cast(None)
 _activeSketch = adsk.fusion.Sketch.cast(None)
 _meshSelectInput = adsk.core.SelectionCommandInput.cast(None)
 _sketchSelectInput = adsk.core.SelectionCommandInput.cast(None)
 _meshState = []
-_pointTol = 0.000001
 _controlId = 'sketchToMesh'
+
+_maxSpacingInput = adsk.core.ValueCommandInput.cast(None)
+_searchToleranceInput = adsk.core.ValueCommandInput.cast(None)
 
 local_handlers = []
 
@@ -115,14 +105,19 @@ def MeshIntersectCommandCreatedEventHandler(args: adsk.core.CommandCreatedEventA
         global _sketchSelectInput
         _sketchSelectInput = inputs.addSelectionInput('sketchSelect', 'Sketch Lines Included', 'Select sketch items to Include.')
         _sketchSelectInput.addSelectionFilter(adsk.core.SelectionCommandInput.SketchLines)
-        _sketchSelectInput.addSelectionFilter(adsk.core.SelectionCommandInput.SketchCurves)
+        #_sketchSelectInput.addSelectionFilter(adsk.core.SelectionCommandInput.SketchCurves)
         #_sketchSelectInput.addSelectionFilter(adsk.core.SelectionCommandInput.ConstructionLines)
         #_sketchSelectInput.addSelectionFilter(adsk.core.SelectionCommandInput.Sketches)
         _sketchSelectInput.setSelectionLimits(1)
 
+        global _maxSpacingInput
+        _maxSpacingInput = inputs.addDistanceValueCommandInput('spacingSelect', 'Line Point Spacing', adsk.core.ValueInput.createByReal(.5))
+        
+        global _searchToleranceInput
+        _searchToleranceInput = inputs.addDistanceValueCommandInput('searchToleranceSelect', 'Search Tolerance Distance', adsk.core.ValueInput.createByReal(.1))             
+    
     except:
         if ui:
-            #ui.messageBox('Unexpected failure.', 'Intersect Mesh Body')
             ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))   
 
 def DestroyHandler(args: adsk.core.CommandEventArgs):
@@ -160,7 +155,7 @@ def MeshIntersectCommandExecutedEventHandler(args: adsk.core.CommandEventArgs):
         #4. These become the new "outline" or search perimeter
         #5. Repeat until next point is found.       
         line = CalculateIntersection(_meshSelectInput.selection(0).entity, _activeSketch, progDialog)
-        if line != None:
+        if line != None and not progDialog.wasCancelled:
             CreateLine(_activeSketch, line)
         
         progDialog.hide()
@@ -174,19 +169,18 @@ def MeshIntersectCommandExecutedEventHandler(args: adsk.core.CommandEventArgs):
 def LineSegments(sketch):
     points = []
     
-    threshhold_toLastPoint = 1 #must be smaller than our resolution.
+    threshhold_toLastPoint = .001
     priorPoint_X = -10000000
     proirPoint_Y = -10000000
     
     index_lineSequence = -1
     
-    resolution = .5 # how close (only x, y considered) points should be.
-    
+    maxSpacing = _maxSpacingInput.value
+
     for i in range(0, _sketchSelectInput.selectionCount):
         obj = _sketchSelectInput.selection(i).entity      
         if obj.objectType == adsk.fusion.SketchLine.classType():
             
-            # obj, points = SequenceLine(obj, points)
             line = adsk.fusion.SketchLine.cast(obj)
             
             if Distance(priorPoint_X, proirPoint_Y, line.startSketchPoint.worldGeometry.x, 
@@ -195,7 +189,7 @@ def LineSegments(sketch):
                 index_lineSequence = index_lineSequence + 1 # new set of points
                 points.append([])
 
-            pointCount = math.floor( line.length / resolution )
+            pointCount = math.floor( line.length / maxSpacing )
             dx = (line.endSketchPoint.worldGeometry.x - line.startSketchPoint.worldGeometry.x) / pointCount
             dy = (line.endSketchPoint.worldGeometry.y - line.startSketchPoint.worldGeometry.y) / pointCount
             
@@ -231,19 +225,16 @@ def CalculateIntersection(mesh, sketch: adsk.fusion.Sketch, progDialog: adsk.cor
     for idxLineSeg in range(0, len(points)):
         progTotal += len(points[idxLineSeg])
     
-    progDialog.show('Projection Calculation', 'Evaluating Mesh Elevations', 0, progTotal) 
+    progDialog.show('Projection Calculation', 'Evaluating Intersection: {} segments'.format(progTotal), 0, progTotal) 
     progDialog.progressValue = 0
     
     #2. For each XY value, evaluate what the Z coordinate of the mesh is
     triangleMesh = mesh.displayMesh
     nodeCoords = triangleMesh.nodeCoordinatesAsDouble
-    nodeCoordsP3D = triangleMesh.nodeCoordinates
     nodeIndices = triangleMesh.nodeIndices
-
-    # Crude initial implementation. Verify the x point and the y point are within 
-    # the thresshold. While this is not very accurate, this should be performant.
-    threshLen = .1
-        
+    
+    searchTolerance = _searchToleranceInput.value
+ 
     for idxLineSeg in range(0, len(points)):
         for idxPoint in range(0, len(points[idxLineSeg])):
             
@@ -256,13 +247,14 @@ def CalculateIntersection(mesh, sketch: adsk.fusion.Sketch, progDialog: adsk.cor
                 y = nodeCoords[(3*nodeIndices[i])+1]
                 z = nodeCoords[(3*nodeIndices[i])+2]
 
-                if abs(points[idxLineSeg][idxPoint][0] - x) < threshLen and abs(points[idxLineSeg][idxPoint][1] - y) < threshLen :
-                #if Distance(x, y, points[idxLineSeg][idxPoint][0], points[idxLineSeg][idxPoint][1]) < threshLen :   
-                                       
+                if abs(points[idxLineSeg][idxPoint][0] - x) < searchTolerance and abs(points[idxLineSeg][idxPoint][1] - y) < searchTolerance :
+                
+                # About half as fast, but we could use to use the "best" fit if desired.
+                # Regardless, implementing the nearest neighbor hashing is really the better solution anyways.
+                #if Distance(x, y, points[idxLineSeg][idxPoint][0], points[idxLineSeg][idxPoint][1]) < searchTolerance :                                       
                     points[idxLineSeg][idxPoint][2] = z
                     break
     
-    #TODO: Omit points we couldn't find a value for?
     return points        
  
 def CreateLine(sketch: adsk.fusion.Sketch, points):
@@ -272,10 +264,9 @@ def CreateLine(sketch: adsk.fusion.Sketch, points):
         
     for idxLineSeg in range(0, len(points)):
         for idxPoint in range(1, len(points[idxLineSeg])):
-        
-            lines.addByTwoPoints(adsk.core.Point3D.create(points[idxLineSeg][idxPoint-1][0], points[idxLineSeg][idxPoint-1][1], points[idxLineSeg][idxPoint-1][2]),
-                                 adsk.core.Point3D.create(points[idxLineSeg][idxPoint][0], points[idxLineSeg][idxPoint][1], points[idxLineSeg][idxPoint][2]))  
-        
+            lines.addByTwoPoints(adsk.core.Point3D.create(points[idxLineSeg][idxPoint-1][0], points[idxLineSeg][idxPoint-1][1], points[idxLineSeg][idxPoint-1][2]), 
+                                 adsk.core.Point3D.create(points[idxLineSeg][idxPoint][0], points[idxLineSeg][idxPoint][1], points[idxLineSeg][idxPoint][2])) 
+               
     sketch.isComputeDeferred = False
     
 def Distance(x1, y1, x2, y2):
